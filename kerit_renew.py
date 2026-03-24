@@ -376,6 +376,28 @@ def extract_remaining_days(sb) -> int:
         return 0
 
 
+def wait_for_modal(sb, timeout=15) -> bool:
+    """等待续期模态框出现"""
+    print("⏳ 等待模态框...")
+    for _ in range(timeout):
+        try:
+            visible = sb.execute_script("""
+                return (
+                    document.querySelector('.modal.show') !== null ||
+                    document.querySelector('[role="dialog"]') !== null ||
+                    document.querySelector('.modal-backdrop') !== null
+                );
+            """)
+            if visible:
+                print("✅ 模态框已出现")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print("⚠️ 模态框等待超时，继续尝试检测Turnstile")
+    return False
+
+
 # ============================================================
 # 续期流程
 # ============================================================
@@ -437,15 +459,19 @@ def do_renew(sb):
 
         print(f"🔁 第{attempt + 1}/{need}次续期...")
 
-        # 点击 Renew Server 按钮
+        # 点击 Renew Server 按钮（JS点击更可靠）
         renew_clicked = False
         for _ in range(10):
             try:
                 btns = sb.find_elements("a, button")
                 btn = next((b for b in btns if "Renew Server" in (b.text or "")), None)
                 if btn:
-                    btn.click()
+                    sb.execute_script("arguments[0].scrollIntoView(true);", btn)
+                    time.sleep(0.5)
+                    sb.execute_script("arguments[0].click();", btn)
                     renew_clicked = True
+                    time.sleep(2)
+                    sb.save_screenshot(f"after_click_{attempt}.png")
                     print("✅ 已点击「Renew Server」")
                     break
             except Exception:
@@ -458,17 +484,25 @@ def do_renew(sb):
             send_tg(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id)
             return
 
-        time.sleep(2)
+        # 等待模态框出现
+        time.sleep(3)
+        wait_for_modal(sb, timeout=15)
 
         print("⏳ 等待Turnstile...")
-        for _ in range(20):
+        turnstile_found = False
+        for _ in range(40):
             if turnstile_exists(sb):
                 print("🛡️ 检测到Turnstile")
+                turnstile_found = True
                 break
             time.sleep(1)
-        else:
-            print("❌ Turnstile未出现")
+
+        if not turnstile_found:
+            print("❌ Turnstile未出现，尝试截图诊断...")
             sb.save_screenshot(f"no_turnstile_{attempt}.png")
+            # 尝试检查页面是否有其他提示
+            page_text = sb.execute_script("return document.body.innerText;")
+            print(f"📄 页面内容片段: {page_text[:300]}")
             send_tg(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id)
             return
 
@@ -513,7 +547,7 @@ def do_renew(sb):
 
         time.sleep(3)
         sb.execute_script("window.location.reload();")
-        time.sleep(3)
+        time.sleep(4)
 
     sb.save_screenshot("renew_done.png")
     final_count = sb.execute_script("""
