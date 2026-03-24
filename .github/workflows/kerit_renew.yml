@@ -1,4 +1,4 @@
-name: Kerit-Login
+name: Kerit-Renew
 on:
   workflow_dispatch:
   schedule:
