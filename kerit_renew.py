@@ -399,18 +399,166 @@ def wait_for_modal(sb, timeout=15) -> bool:
 
 
 # ============================================================
+# 等待页面动态数据加载完成
+# ============================================================
+
+def wait_for_page_data(sb, timeout=20) -> dict:
+    """
+    等待 renewal-count 和 serverData 都加载完毕。
+    返回 {'count': int, 'remaining': int, 'server_id': str/None}
+    """
+    print("⏳ 等待页面数据加载...")
+    for i in range(timeout):
+        try:
+            data = sb.execute_script("""
+                (function(){
+                    var countEl = document.getElementById('renewal-count');
+                    var expiryEl = document.getElementById('expiry-display');
+                    var sid = (typeof serverData !== 'undefined' && serverData && serverData.id)
+                              ? String(serverData.id) : null;
+                    var countText = countEl ? countEl.innerText.trim() : '';
+                    var expiryText = expiryEl ? expiryEl.innerText.trim() : '';
+                    return {
+                        server_id: sid,
+                        count_text: countText,
+                        expiry_text: expiryText,
+                        count: countText !== '' ? parseInt(countText) : -1,
+                        remaining: expiryText !== '' ? parseInt(expiryText) : -1
+                    };
+                })()
+            """)
+            # 等到 server_id 有值、count 也不为 -1
+            if data and data.get('server_id') and data.get('count', -1) >= 0:
+                print(f"✅ 页面数据就绪: count={data['count']}, remaining={data['remaining']}, id={data['server_id']}")
+                return data
+            else:
+                print(f"   [{i+1}/{timeout}] 等待中... server_id={data.get('server_id')}, count_text='{data.get('count_text')}', expiry_text='{data.get('expiry_text')}'")
+        except Exception as e:
+            print(f"   [{i+1}/{timeout}] JS执行异常: {e}")
+        time.sleep(1)
+
+    # 超时后返回最后一次读到的值（可能不完整）
+    print("⚠️ 页面数据加载超时，使用当前值")
+    try:
+        data = sb.execute_script("""
+            (function(){
+                var countEl = document.getElementById('renewal-count');
+                var expiryEl = document.getElementById('expiry-display');
+                var sid = (typeof serverData !== 'undefined' && serverData && serverData.id)
+                          ? String(serverData.id) : null;
+                return {
+                    server_id: sid,
+                    count: countEl ? (parseInt(countEl.innerText) || 0) : 0,
+                    remaining: expiryEl ? (parseInt(expiryEl.innerText) || 0) : 0
+                };
+            })()
+        """)
+        return data or {}
+    except Exception:
+        return {}
+
+
+# ============================================================
+# 查找续期按钮（多策略）
+# ============================================================
+
+def find_renew_button(sb):
+    """
+    尝试多种方式定位「Renew Server」按钮，返回元素或 None。
+    先打印页面上所有可见按钮/链接的文本，方便调试。
+    """
+    # 打印所有按钮文本，方便排查
+    try:
+        btn_texts = sb.execute_script("""
+            (function(){
+                var els = document.querySelectorAll('a, button, input[type="submit"], input[type="button"]');
+                var result = [];
+                els.forEach(function(el){
+                    var t = (el.innerText || el.value || el.textContent || '').trim();
+                    if (t) result.push(t.substring(0, 60));
+                });
+                return result;
+            })()
+        """)
+        print(f"📋 页面按钮文本: {btn_texts}")
+    except Exception:
+        pass
+
+    # 策略1: 精确文本匹配（大小写不敏感）
+    keywords = ["renew server", "renew", "续期", "延期", "extend"]
+    try:
+        btns = sb.find_elements("a, button")
+        for btn in btns:
+            text = (btn.text or "").strip().lower()
+            if any(kw in text for kw in keywords):
+                print(f"✅ 找到按钮（文本匹配）: '{btn.text.strip()}'")
+                return btn
+    except Exception:
+        pass
+
+    # 策略2: XPath 包含文本
+    for xpath in [
+        '//*[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
+        '//*[@id="renew-btn"]',
+        '//*[contains(@class, "renew")]',
+        '//*[contains(@onclick, "renew")]',
+        '//*[contains(@data-action, "renew")]',
+    ]:
+        try:
+            el = sb.find_element(xpath)
+            if el and el.is_displayed():
+                print(f"✅ 找到按钮（XPath）: {xpath}")
+                return el
+        except Exception:
+            continue
+
+    # 策略3: JS querySelector
+    try:
+        el = sb.execute_script("""
+            (function(){
+                var selectors = [
+                    '#renew-btn',
+                    '[id*="renew"]',
+                    '[class*="renew"]',
+                    '[onclick*="renew"]',
+                    '[data-action*="renew"]'
+                ];
+                for (var i = 0; i < selectors.length; i++) {
+                    var el = document.querySelector(selectors[i]);
+                    if (el) return el;
+                }
+                // 全文本搜索
+                var all = document.querySelectorAll('a, button');
+                for (var j = 0; j < all.length; j++) {
+                    var t = (all[j].innerText || '').toLowerCase();
+                    if (t.includes('renew')) return all[j];
+                }
+                return null;
+            })()
+        """)
+        if el:
+            print(f"✅ 找到按钮（JS querySelector）")
+            return el
+    except Exception:
+        pass
+
+    return None
+
+
+# ============================================================
 # 续期流程
 # ============================================================
 
 def do_renew(sb):
     print("🔄 跳转续期页...")
     sb.open(FREE_PANEL_URL)
-    time.sleep(4)
+    time.sleep(5)  # 给页面 JS 充分初始化时间
     sb.save_screenshot("free_panel.png")
 
-    server_id = sb.execute_script(
-        "(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()"
-    )
+    # 等待页面动态数据加载（修复：之前直接读取导致0/7）
+    page_data = wait_for_page_data(sb, timeout=25)
+
+    server_id = page_data.get('server_id')
     if not server_id:
         print("❌ serverData.id缺失")
         sb.save_screenshot("no_server_id.png")
@@ -418,13 +566,8 @@ def do_renew(sb):
         return
     print(f"🆔 服务器ID: {server_id}")
 
-    initial_count = sb.execute_script("""
-        (function(){
-            var el = document.getElementById('renewal-count');
-            return el ? parseInt(el.innerText || "0") : 0;
-        })()
-    """)
-    initial_remaining = extract_remaining_days(sb)
+    initial_count = page_data.get('count', 0)
+    initial_remaining = page_data.get('remaining', 0)
     need = 7 - initial_count
     print(f"📊 当前进度: {initial_count}/7，剩余天数: {initial_remaining}天，本次需续期: {need}次")
 
@@ -442,10 +585,11 @@ def do_renew(sb):
         return
 
     for attempt in range(need):
+        # 重新读取当前进度（每次续期后reload了页面）
         count = sb.execute_script("""
             (function(){
                 var el = document.getElementById('renewal-count');
-                return el ? parseInt(el.innerText || "0") : 0;
+                return el ? (parseInt(el.innerText) || 0) : 0;
             })()
         """)
         print(f"📊 续期进度: {count}/7")
@@ -459,28 +603,37 @@ def do_renew(sb):
 
         print(f"🔁 第{attempt + 1}/{need}次续期...")
 
-        # 点击 Renew Server 按钮（JS点击更可靠）
+        # ── 查找并点击续期按钮 ──────────────────────────────
         renew_clicked = False
-        for _ in range(10):
-            try:
-                btns = sb.find_elements("a, button")
-                btn = next((b for b in btns if "Renew Server" in (b.text or "")), None)
-                if btn:
-                    sb.execute_script("arguments[0].scrollIntoView(true);", btn)
+        for retry in range(15):
+            btn = find_renew_button(sb)
+            if btn:
+                try:
+                    sb.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                     time.sleep(0.5)
                     sb.execute_script("arguments[0].click();", btn)
                     renew_clicked = True
                     time.sleep(2)
                     sb.save_screenshot(f"after_click_{attempt}.png")
-                    print("✅ 已点击「Renew Server」")
+                    print("✅ 已点击续期按钮")
                     break
-            except Exception:
-                pass
-            time.sleep(1)
+                except Exception as e:
+                    print(f"⚠️ 点击失败（{retry+1}）: {e}")
+            else:
+                print(f"   [{retry+1}/15] 未找到续期按钮，等待中...")
+            time.sleep(2)
 
         if not renew_clicked:
             print("❌ 续期按钮缺失")
             sb.save_screenshot("no_renew_btn.png")
+            # 保存页面源码帮助排查
+            try:
+                html = sb.get_page_source()
+                with open(f"page_source_{attempt}.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                print(f"📄 已保存页面源码: page_source_{attempt}.html")
+            except Exception:
+                pass
             send_tg(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id)
             return
 
@@ -500,7 +653,6 @@ def do_renew(sb):
         if not turnstile_found:
             print("❌ Turnstile未出现，尝试截图诊断...")
             sb.save_screenshot(f"no_turnstile_{attempt}.png")
-            # 尝试检查页面是否有其他提示
             page_text = sb.execute_script("return document.body.innerText;")
             print(f"📄 页面内容片段: {page_text[:300]}")
             send_tg(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id)
@@ -538,7 +690,7 @@ def do_renew(sb):
             else:
                 print(f"❌ 续期失败: {result}")
         except Exception:
-            print(f"✅ 续期成功")
+            print(f"✅ 续期成功（原始响应: {result}）")
 
         try:
             sb.execute_script("document.querySelector('[data-bs-dismiss=\"modal\"]')?.click();")
@@ -547,16 +699,16 @@ def do_renew(sb):
 
         time.sleep(3)
         sb.execute_script("window.location.reload();")
-        time.sleep(4)
+        # reload 后重新等待数据加载
+        time.sleep(3)
+        wait_for_page_data(sb, timeout=15)
 
     sb.save_screenshot("renew_done.png")
-    final_count = sb.execute_script("""
-        (function(){
-            var el = document.getElementById('renewal-count');
-            return el ? parseInt(el.innerText || "0") : 0;
-        })()
-    """)
-    final_remaining = extract_remaining_days(sb)
+
+    # 最终读取
+    final_data = wait_for_page_data(sb, timeout=10)
+    final_count = final_data.get('count', 0)
+    final_remaining = final_data.get('remaining', 0)
     print(f"📊 最终进度: {final_count}/7")
     if final_count >= 7:
         print("🎉 已达上限7/7")
