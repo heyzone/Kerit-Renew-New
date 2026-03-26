@@ -203,50 +203,11 @@ def xdotool_click(x, y):
         subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, check=True)
         time.sleep(0.15)
         subprocess.run(["xdotool", "click", "1"], timeout=2, check=True)
-        print(f"📐 坐标点击成功")
+        print(f"📐 坐标点击成功: ({x}, {y})")
         return True
     except Exception as e:
         print(f"⚠️ xdotool点击失败：{e}")
         return False
-
-
-def get_turnstile_coords(sb):
-    try:
-        return sb.execute_script("""
-            (function(){
-                var iframes = document.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    var src = iframes[i].src || '';
-                    if (src.includes('cloudflare') || src.includes('turnstile')) {
-                        var rect = iframes[i].getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) {
-                            return {
-                                click_x: Math.round(rect.x + 30),
-                                click_y: Math.round(rect.y + rect.height / 2)
-                            };
-                        }
-                    }
-                }
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                if (input) {
-                    var container = input.parentElement;
-                    for (var j = 0; j < 5; j++) {
-                        if (!container) break;
-                        var rect = container.getBoundingClientRect();
-                        if (rect.width > 100 && rect.height > 30) {
-                            return {
-                                click_x: Math.round(rect.x + 30),
-                                click_y: Math.round(rect.y + rect.height / 2)
-                            };
-                        }
-                        container = container.parentElement;
-                    }
-                }
-                return null;
-            })()
-        """)
-    except Exception:
-        return None
 
 
 def get_window_offset(sb):
@@ -332,6 +293,45 @@ def turnstile_exists(sb) -> bool:
         return False
 
 
+def get_turnstile_coords(sb):
+    try:
+        return sb.execute_script("""
+            (function(){
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    var src = iframes[i].src || '';
+                    if (src.includes('cloudflare') || src.includes('turnstile')) {
+                        var rect = iframes[i].getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2)
+                            };
+                        }
+                    }
+                }
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) {
+                    var container = input.parentElement;
+                    for (var j = 0; j < 5; j++) {
+                        if (!container) break;
+                        var rect = container.getBoundingClientRect();
+                        if (rect.width > 100 && rect.height > 30) {
+                            return {
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2)
+                            };
+                        }
+                        container = container.parentElement;
+                    }
+                }
+                return null;
+            })()
+        """)
+    except Exception:
+        return None
+
+
 def solve_turnstile(sb) -> bool:
     for _ in range(3):
         sb.execute_script(EXPAND_POPUP_JS)
@@ -364,12 +364,18 @@ def solve_turnstile(sb) -> bool:
 
 
 def extract_remaining_days(sb) -> int:
-    """从 expiry-display 元素读取剩余天数"""
     try:
         return sb.execute_script("""
             (function(){
-                var el = document.getElementById('expiry-display');
-                return el ? parseInt(el.innerText || "0") : 0;
+                var el = document.getElementById('expiry-display')
+                       || document.getElementById('time-remaining')
+                       || document.querySelector('[id*="expiry"]')
+                       || document.querySelector('[id*="remaining"]');
+                if (el) {
+                    var m = el.innerText.match(/(\d+)/);
+                    return m ? parseInt(m[1]) : 0;
+                }
+                return 0;
             })()
         """) or 0
     except Exception:
@@ -377,7 +383,6 @@ def extract_remaining_days(sb) -> int:
 
 
 def wait_for_modal(sb, timeout=15) -> bool:
-    """等待续期模态框出现"""
     print("⏳ 等待模态框...")
     for _ in range(timeout):
         try:
@@ -402,54 +407,100 @@ def wait_for_modal(sb, timeout=15) -> bool:
 # 等待页面动态数据加载完成
 # ============================================================
 
-def wait_for_page_data(sb, timeout=20) -> dict:
+def wait_for_page_data(sb, timeout=25) -> dict:
     """
     等待 renewal-count 和 serverData 都加载完毕。
-    返回 {'count': int, 'remaining': int, 'server_id': str/None}
+    兼容 "6 / 7" 格式和纯数字格式。
     """
     print("⏳ 等待页面数据加载...")
     for i in range(timeout):
         try:
             data = sb.execute_script("""
                 (function(){
-                    var countEl = document.getElementById('renewal-count');
-                    var expiryEl = document.getElementById('expiry-display');
-                    var sid = (typeof serverData !== 'undefined' && serverData && serverData.id)
-                              ? String(serverData.id) : null;
+                    var countEl = document.getElementById('renewal-count')
+                                || document.getElementById('renewals-count')
+                                || document.querySelector('[id*="renewal"][id*="count"]')
+                                || document.querySelector('[id*="renew"][id*="count"]');
+
+                    var expiryEl = document.getElementById('expiry-display')
+                                 || document.getElementById('time-remaining')
+                                 || document.querySelector('[id*="expiry"]')
+                                 || document.querySelector('[id*="remaining"]');
+
+                    var sid = null;
+                    if (typeof serverData !== 'undefined' && serverData && serverData.id) {
+                        sid = String(serverData.id);
+                    }
+
                     var countText = countEl ? countEl.innerText.trim() : '';
                     var expiryText = expiryEl ? expiryEl.innerText.trim() : '';
+
+                    // 支持 "6 / 7" 或 "6/7" 或纯 "6"
+                    var countVal = -1;
+                    var m = countText.match(/(\d+)\s*[\/\|]\s*(\d+)/);
+                    if (m) {
+                        countVal = parseInt(m[1]);
+                    } else if (countText !== '') {
+                        var n = countText.match(/(\d+)/);
+                        if (n) countVal = parseInt(n[1]);
+                    }
+
+                    // 剩余天数
+                    var expiryVal = -1;
+                    if (expiryText !== '') {
+                        var em = expiryText.match(/(\d+)/);
+                        if (em) expiryVal = parseInt(em[1]);
+                    }
+                    // fallback: 从 TIME REMAINING 卡片读取天数
+                    if (expiryVal < 0) {
+                        var allEls = document.querySelectorAll('*');
+                        for (var c = 0; c < allEls.length; c++) {
+                            var txt = (allEls[c].childNodes.length <= 3)
+                                      ? (allEls[c].innerText || '') : '';
+                            var dm = txt.match(/^(\d+)\s*[Dd]ays?$/);
+                            if (dm) { expiryVal = parseInt(dm[1]); break; }
+                        }
+                    }
+
                     return {
                         server_id: sid,
                         count_text: countText,
                         expiry_text: expiryText,
-                        count: countText !== '' ? parseInt(countText) : -1,
-                        remaining: expiryText !== '' ? parseInt(expiryText) : -1
+                        count: countVal,
+                        remaining: expiryVal >= 0 ? expiryVal : 0
                     };
                 })()
             """)
-            # 等到 server_id 有值、count 也不为 -1
             if data and data.get('server_id') and data.get('count', -1) >= 0:
                 print(f"✅ 页面数据就绪: count={data['count']}, remaining={data['remaining']}, id={data['server_id']}")
                 return data
             else:
-                print(f"   [{i+1}/{timeout}] 等待中... server_id={data.get('server_id')}, count_text='{data.get('count_text')}', expiry_text='{data.get('expiry_text')}'")
+                print(f"   [{i+1}/{timeout}] 等待中... id={data.get('server_id')}, count='{data.get('count_text')}', expiry='{data.get('expiry_text')}'")
         except Exception as e:
-            print(f"   [{i+1}/{timeout}] JS执行异常: {e}")
+            print(f"   [{i+1}/{timeout}] JS异常: {e}")
         time.sleep(1)
 
-    # 超时后返回最后一次读到的值（可能不完整）
     print("⚠️ 页面数据加载超时，使用当前值")
     try:
         data = sb.execute_script("""
             (function(){
-                var countEl = document.getElementById('renewal-count');
-                var expiryEl = document.getElementById('expiry-display');
+                var countEl = document.getElementById('renewal-count')
+                            || document.getElementById('renewals-count')
+                            || document.querySelector('[id*="renewal"][id*="count"]');
+                var expiryEl = document.getElementById('expiry-display')
+                             || document.querySelector('[id*="expiry"]')
+                             || document.querySelector('[id*="remaining"]');
                 var sid = (typeof serverData !== 'undefined' && serverData && serverData.id)
                           ? String(serverData.id) : null;
+                var countText = countEl ? countEl.innerText.trim() : '0';
+                var cm = countText.match(/(\d+)/);
+                var countVal = cm ? parseInt(cm[1]) : 0;
+                var expiryText = expiryEl ? expiryEl.innerText.trim() : '0';
+                var em = expiryText.match(/(\d+)/);
                 return {
                     server_id: sid,
-                    count: countEl ? (parseInt(countEl.innerText) || 0) : 0,
-                    remaining: expiryEl ? (parseInt(expiryEl.innerText) || 0) : 0
+                    count: countVal,
+                    remaining: em ? parseInt(em[1]) : 0
                 };
             })()
         """)
@@ -459,90 +510,154 @@ def wait_for_page_data(sb, timeout=20) -> dict:
 
 
 # ============================================================
-# 查找续期按钮（多策略）
+# 查找并点击续期按钮（全坐标方案，解决 Shadow DOM + arguments 问题）
 # ============================================================
 
-def find_renew_button(sb):
+def find_and_click_renew_button(sb) -> bool:
     """
-    尝试多种方式定位「Renew Server」按钮，返回元素或 None。
-    先打印页面上所有可见按钮/链接的文本，方便调试。
+    用纯 JS 定位「Renew Server」按钮的屏幕坐标，
+    再用 xdotool 点击——完全绕过 arguments/Shadow DOM 限制。
     """
-    # 打印所有按钮文本，方便排查
+    # ── 策略1: 遍历所有元素，匹配文本，取坐标 ──────────────
     try:
-        btn_texts = sb.execute_script("""
+        rect = sb.execute_script("""
             (function(){
-                var els = document.querySelectorAll('a, button, input[type="submit"], input[type="button"]');
-                var result = [];
-                els.forEach(function(el){
-                    var t = (el.innerText || el.value || el.textContent || '').trim();
-                    if (t) result.push(t.substring(0, 60));
-                });
-                return result;
-            })()
-        """)
-        print(f"📋 页面按钮文本: {btn_texts}")
-    except Exception:
-        pass
-
-    # 策略1: 精确文本匹配（大小写不敏感）
-    keywords = ["renew server", "renew", "续期", "延期", "extend"]
-    try:
-        btns = sb.find_elements("a, button")
-        for btn in btns:
-            text = (btn.text or "").strip().lower()
-            if any(kw in text for kw in keywords):
-                print(f"✅ 找到按钮（文本匹配）: '{btn.text.strip()}'")
-                return btn
-    except Exception:
-        pass
-
-    # 策略2: XPath 包含文本
-    for xpath in [
-        '//*[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
-        '//*[@id="renew-btn"]',
-        '//*[contains(@class, "renew")]',
-        '//*[contains(@onclick, "renew")]',
-        '//*[contains(@data-action, "renew")]',
-    ]:
-        try:
-            el = sb.find_element(xpath)
-            if el and el.is_displayed():
-                print(f"✅ 找到按钮（XPath）: {xpath}")
-                return el
-        except Exception:
-            continue
-
-    # 策略3: JS querySelector
-    try:
-        el = sb.execute_script("""
-            (function(){
-                var selectors = [
-                    '#renew-btn',
-                    '[id*="renew"]',
-                    '[class*="renew"]',
-                    '[onclick*="renew"]',
-                    '[data-action*="renew"]'
-                ];
-                for (var i = 0; i < selectors.length; i++) {
-                    var el = document.querySelector(selectors[i]);
-                    if (el) return el;
-                }
-                // 全文本搜索
-                var all = document.querySelectorAll('a, button');
-                for (var j = 0; j < all.length; j++) {
-                    var t = (all[j].innerText || '').toLowerCase();
-                    if (t.includes('renew')) return all[j];
+                var keywords = ['renew server', 'renew'];
+                var tags = ['button', 'a', '[role="button"]', 'input[type="submit"]',
+                            'input[type="button"]', 'span', 'div'];
+                for (var t = 0; t < tags.length; t++) {
+                    var els = document.querySelectorAll(tags[t]);
+                    for (var i = 0; i < els.length; i++) {
+                        var el = els[i];
+                        var text = (el.innerText || el.textContent || el.value || '').toLowerCase().trim();
+                        // 只取叶子节点或文本非常短的节点，避免匹配整个页面
+                        if (text.length > 30) continue;
+                        for (var k = 0; k < keywords.length; k++) {
+                            if (text === keywords[k] || text.startsWith(keywords[k])) {
+                                el.scrollIntoView({block: 'center', inline: 'center'});
+                                var r = el.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) {
+                                    return {x: r.x, y: r.y, w: r.width, h: r.height, text: text};
+                                }
+                            }
+                        }
+                    }
                 }
                 return null;
             })()
         """)
-        if el:
-            print(f"✅ 找到按钮（JS querySelector）")
-            return el
+        if rect and rect.get('w', 0) > 0:
+            time.sleep(0.4)  # 等 scrollIntoView 生效
+            win_x, win_y, toolbar = get_window_offset(sb)
+            abs_x = int(rect['x'] + rect['w'] / 2) + win_x
+            abs_y = int(rect['y'] + rect['h'] / 2) + win_y + toolbar
+            print(f"✅ 找到续期按钮 ('{rect.get('text', '')}')，坐标: ({abs_x}, {abs_y})")
+            if xdotool_click(abs_x, abs_y):
+                return True
+    except Exception as e:
+        print(f"⚠️ 策略1异常: {e}")
+
+    # ── 策略2: SeleniumBase 原生 click（普通按钮备用）────────
+    xpaths = [
+        '//button[normalize-space(.)="Renew Server"]',
+        '//a[normalize-space(.)="Renew Server"]',
+        '//button[contains(translate(normalize-space(.), "RENW SRVABCDFGHIJKLMOQTUVXYZ", "renw srvaabcdfghijklmoqtuvxyz"), "renew server")]',
+        '//button[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
+        '//a[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
+        '//*[@id="renew-btn"]',
+        '//*[contains(@class,"renew-btn")]',
+        '//*[contains(@class,"renew")][@role="button"]',
+    ]
+    for xpath in xpaths:
+        try:
+            if sb.is_element_visible(xpath):
+                sb.click(xpath)
+                print(f"✅ 找到续期按钮（sb.click）: {xpath}")
+                return True
+        except Exception:
+            continue
+
+    # ── 策略3: 打印所有按钮信息，辅助排查 ───────────────────
+    try:
+        info = sb.execute_script("""
+            (function(){
+                var result = [];
+                var els = document.querySelectorAll('a, button, [role="button"]');
+                els.forEach(function(el) {
+                    var t = (el.innerText || el.textContent || '').trim().replace(/\\s+/g,' ');
+                    var r = el.getBoundingClientRect();
+                    if (t && r.width > 0 && t.length < 60) {
+                        result.push('"' + t + '" @(' + Math.round(r.x+r.width/2) + ',' + Math.round(r.y+r.height/2) + ')');
+                    }
+                });
+                return result;
+            })()
+        """)
+        print(f"📋 所有可见按钮: {info}")
     except Exception:
         pass
 
-    return None
+    return False
+
+
+# ============================================================
+# 提交续期 API
+# ============================================================
+
+def submit_renew_api(sb, server_id: str, token: str) -> bool:
+    """
+    用 execute_async_script 提交 /api/renew，
+    避免 execute_script 对 Promise 返回 None 的问题。
+    """
+    try:
+        result = sb.execute_async_script("""
+            var callback = arguments[arguments.length - 1];
+            var sid = arguments[0];
+            var tok = arguments[1];
+            fetch('/api/renew', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ id: sid, captcha: tok })
+            })
+            .then(function(res) { return res.json(); })
+            .then(function(data) { callback(JSON.stringify(data)); })
+            .catch(function(e) { callback(JSON.stringify({error: e.message})); });
+        """, server_id, token)
+        print(f"✅ 续期API响应: {result}")
+        try:
+            import json as _json
+            obj = _json.loads(result) if result else {}
+            if obj.get('error'):
+                print(f"⚠️ API返回错误: {obj['error']}")
+                return False
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"⚠️ execute_async_script失败，尝试同步方式: {e}")
+
+    # fallback: 用 setTimeout 包装绕过 Promise
+    try:
+        sb.execute_script("""
+            (function(sid, tok){
+                fetch('/api/renew', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ id: sid, captcha: tok })
+                }).then(function(r){return r.json();})
+                  .then(function(d){window.__renewResult=JSON.stringify(d);})
+                  .catch(function(e){window.__renewResult='{"error":"'+e.message+'"}'});
+            })(arguments[0], arguments[1]);
+        """, server_id, token)
+        time.sleep(3)
+        result = sb.execute_script("return window.__renewResult || null;")
+        print(f"✅ 续期API响应（fallback）: {result}")
+        return True
+    except Exception as e2:
+        print(f"❌ 续期API提交失败: {e2}")
+        return False
 
 
 # ============================================================
@@ -552,10 +667,9 @@ def find_renew_button(sb):
 def do_renew(sb):
     print("🔄 跳转续期页...")
     sb.open(FREE_PANEL_URL)
-    time.sleep(5)  # 给页面 JS 充分初始化时间
+    time.sleep(5)
     sb.save_screenshot("free_panel.png")
 
-    # 等待页面动态数据加载（修复：之前直接读取导致0/7）
     page_data = wait_for_page_data(sb, timeout=25)
 
     server_id = page_data.get('server_id')
@@ -566,7 +680,7 @@ def do_renew(sb):
         return
     print(f"🆔 服务器ID: {server_id}")
 
-    initial_count = page_data.get('count', 0)
+    initial_count     = page_data.get('count', 0)
     initial_remaining = page_data.get('remaining', 0)
     need = 7 - initial_count
     print(f"📊 当前进度: {initial_count}/7，剩余天数: {initial_remaining}天，本次需续期: {need}次")
@@ -580,18 +694,27 @@ def do_renew(sb):
     if need <= 0:
         print("🎉 已达上限7/7，无需续期")
         sb.save_screenshot("renew_full.png")
-        remaining = extract_remaining_days(sb)
-        send_tg("✅ 无需续期（已达上限 7/7）", server_id, remaining)
+        send_tg("✅ 无需续期（已达上限 7/7）", server_id, initial_remaining)
         return
 
     for attempt in range(need):
-        # 重新读取当前进度（每次续期后reload了页面）
-        count = sb.execute_script("""
-            (function(){
-                var el = document.getElementById('renewal-count');
-                return el ? (parseInt(el.innerText) || 0) : 0;
-            })()
-        """)
+        # 重新读取当前进度
+        try:
+            count = sb.execute_script("""
+                (function(){
+                    var el = document.getElementById('renewal-count')
+                           || document.getElementById('renewals-count')
+                           || document.querySelector('[id*="renewal"][id*="count"]');
+                    if (!el) return 0;
+                    var t = el.innerText.trim();
+                    var m = t.match(/(\d+)/);
+                    return m ? parseInt(m[1]) : 0;
+                })()
+            """)
+            count = count if isinstance(count, int) else 0
+        except Exception:
+            count = initial_count + attempt
+
         print(f"📊 续期进度: {count}/7")
 
         if count >= 7:
@@ -605,28 +728,18 @@ def do_renew(sb):
 
         # ── 查找并点击续期按钮 ──────────────────────────────
         renew_clicked = False
-        for retry in range(15):
-            btn = find_renew_button(sb)
-            if btn:
-                try:
-                    sb.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                    time.sleep(0.5)
-                    sb.execute_script("arguments[0].click();", btn)
-                    renew_clicked = True
-                    time.sleep(2)
-                    sb.save_screenshot(f"after_click_{attempt}.png")
-                    print("✅ 已点击续期按钮")
-                    break
-                except Exception as e:
-                    print(f"⚠️ 点击失败（{retry+1}）: {e}")
-            else:
-                print(f"   [{retry+1}/15] 未找到续期按钮，等待中...")
+        for retry in range(10):
+            if find_and_click_renew_button(sb):
+                renew_clicked = True
+                time.sleep(2)
+                sb.save_screenshot(f"after_click_{attempt}.png")
+                break
+            print(f"   [{retry+1}/10] 未点击成功，重试...")
             time.sleep(2)
 
         if not renew_clicked:
-            print("❌ 续期按钮缺失")
+            print("❌ 续期按钮无法点击")
             sb.save_screenshot("no_renew_btn.png")
-            # 保存页面源码帮助排查
             try:
                 html = sb.get_page_source()
                 with open(f"page_source_{attempt}.html", "w", encoding="utf-8") as f:
@@ -634,7 +747,7 @@ def do_renew(sb):
                 print(f"📄 已保存页面源码: page_source_{attempt}.html")
             except Exception:
                 pass
-            send_tg(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id)
+            send_tg(f"❌ 续期按钮无法点击，第{attempt + 1}次失败", server_id)
             return
 
         # 等待模态框出现
@@ -651,7 +764,7 @@ def do_renew(sb):
             time.sleep(1)
 
         if not turnstile_found:
-            print("❌ Turnstile未出现，尝试截图诊断...")
+            print("❌ Turnstile未出现，截图诊断...")
             sb.save_screenshot(f"no_turnstile_{attempt}.png")
             page_text = sb.execute_script("return document.body.innerText;")
             print(f"📄 页面内容片段: {page_text[:300]}")
@@ -670,46 +783,33 @@ def do_renew(sb):
             return
 
         print("🎯 提交续期...")
-        result = sb.execute_script(f"""
-            (async function() {{
-                const res = await fetch('/api/renew', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    credentials: 'include',
-                    body: JSON.stringify({{ id: '{server_id}', captcha: '{token}' }})
-                }});
-                const data = await res.json();
-                return JSON.stringify(data);
-            }})()
-        """)
-        try:
-            import json as _json
-            res_obj = _json.loads(result)
-            if res_obj.get('success') or res_obj == {}:
-                print("✅ 续期成功")
-            else:
-                print(f"❌ 续期失败: {result}")
-        except Exception:
-            print(f"✅ 续期成功（原始响应: {result}）")
+        if not submit_renew_api(sb, server_id, token):
+            send_tg(f"❌ 续期API提交失败，第{attempt + 1}次", server_id)
+            return
 
+        # 关闭模态框
         try:
-            sb.execute_script("document.querySelector('[data-bs-dismiss=\"modal\"]')?.click();")
+            sb.execute_script("""
+                (function(){
+                    var btn = document.querySelector('[data-bs-dismiss="modal"]')
+                           || document.querySelector('.modal .btn-close')
+                           || document.querySelector('.modal [aria-label="Close"]');
+                    if (btn) btn.click();
+                })()
+            """)
         except Exception:
             pass
 
         time.sleep(3)
         sb.execute_script("window.location.reload();")
-        # reload 后重新等待数据加载
-        time.sleep(3)
+        time.sleep(4)
         wait_for_page_data(sb, timeout=15)
 
     sb.save_screenshot("renew_done.png")
-
-    # 最终读取
-    final_data = wait_for_page_data(sb, timeout=10)
-    final_count = final_data.get('count', 0)
+    final_data      = wait_for_page_data(sb, timeout=10)
+    final_count     = final_data.get('count', 0)
     final_remaining = final_data.get('remaining', 0)
-    print(f"📊 最终进度: {final_count}/7")
+    print(f"📊 最终进度: {final_count}/7，剩余天数: {final_remaining}天")
     if final_count >= 7:
         print("🎉 已达上限7/7")
         send_tg("✅ 续期完成", server_id, final_remaining)
