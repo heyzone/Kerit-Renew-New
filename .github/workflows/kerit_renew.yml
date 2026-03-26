@@ -2,7 +2,7 @@ name: Kerit-Renew
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 1 */5 * *'
+    - cron: '0 1 * * *'
 jobs:
   run_kerit_login:
     runs-on: ubuntu-latest
